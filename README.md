@@ -26,3 +26,7 @@ This service is a read-only Streamlit dashboard for the Money Flow Early Detecto
 - `requirements.txt` — Python dependencies
 - `Procfile` — Railway start command
 - `railway.toml` — deploy/start configuration
+
+## v1.1 display update
+
+Acceleration events now show Detection Time (the qualifying +4% crossing), plus the +2%, +4%, and +8% crossing times in IST.

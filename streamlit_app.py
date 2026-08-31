@@ -463,6 +463,16 @@ def ts_ist(v):
     return t.tz_convert("Asia/Kolkata").strftime("%d %b %H:%M:%S")
 
 
+def time_ist(v):
+    """Compact IST time for detector event timestamps."""
+    if v is None or pd.isna(v):
+        return "-"
+    t = pd.Timestamp(v)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    return t.tz_convert("Asia/Kolkata").strftime("%H:%M")
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -619,6 +629,9 @@ with tab2:
                 html = (
                     f'<div style="border:2px solid {border};border-radius:14px;padding:12px 14px;margin:8px 0;">'
                     f'<b>{r.get("build_state","-")} — #{r.get("money_flow_rank","-")} {r.get("symbol","-")}</b><br>'
+                    f'Detected: <b>{time_ist(r.get("time_4pct"))} IST</b> &nbsp;|&nbsp; '
+                    f'2% crossed: <b>{time_ist(r.get("time_2pct"))}</b> &nbsp;|&nbsp; '
+                    f'4% crossed: <b>{time_ist(r.get("time_4pct"))}</b><br>'
                     f'2→4 OI: <b>{num(r.get("minutes_2_to_4"),0," min")}</b> &nbsp;|&nbsp; '
                     f'Fut @4%: <b>{num(r.get("future_move_at_4pct"),2,"%")}</b> &nbsp;|&nbsp; '
                     f'Exposure @4%: <b>{num(r.get("exposure_at_4pct_cr"),2," Cr")}</b><br>'
@@ -630,16 +643,22 @@ with tab2:
         else:
             st.info("No Accelerating Long/Short state has qualified yet on the latest trading day.")
 
-        cols = ["money_flow_rank","symbol","build_state","oi_stage","future_oi_change_pct_t0",
-                "future_price_change_from_930_pct","futures_exposure_change_cr","minutes_2_to_4",
-                "minutes_4_to_8","future_move_at_4pct","exposure_at_4pct_cr","zone_state","next_zone"]
+        cols = ["money_flow_rank","symbol","build_state","time_4pct","time_2pct","minutes_2_to_4",
+                "oi_stage","future_oi_change_pct_t0","future_price_change_from_930_pct",
+                "futures_exposure_change_cr","minutes_4_to_8","future_move_at_4pct",
+                "exposure_at_4pct_cr","zone_state","next_zone"]
         view = early[[c for c in cols if c in early.columns]].copy()
+        if "time_4pct" in view:
+            view["time_4pct"] = view["time_4pct"].apply(time_ist)
+        if "time_2pct" in view:
+            view["time_2pct"] = view["time_2pct"].apply(time_ist)
         for c in ["future_oi_change_pct_t0","future_price_change_from_930_pct","futures_exposure_change_cr",
                   "minutes_2_to_4","minutes_4_to_8","future_move_at_4pct","exposure_at_4pct_cr"]:
             if c in view: view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
         st.markdown("### All Top-20 stocks")
         st.dataframe(view, use_container_width=True, hide_index=True, column_config={
-            "money_flow_rank":"Rank", "symbol":"Symbol", "build_state":"Build State", "oi_stage":"OI Stage",
+            "money_flow_rank":"Rank", "symbol":"Symbol", "build_state":"Build State",
+            "time_4pct":"Detection Time", "time_2pct":"2% Time", "oi_stage":"OI Stage",
             "future_oi_change_pct_t0":st.column_config.NumberColumn("OI vs 09:30",format="%.2f%%"),
             "future_price_change_from_930_pct":st.column_config.NumberColumn("Fut vs 09:30",format="%.2f%%"),
             "futures_exposure_change_cr":st.column_config.NumberColumn("Exposure Δ ₹Cr",format="%.2f"),
@@ -667,10 +686,17 @@ with tab3:
         h3.metric("Trading days", hist_events["trading_date"].nunique())
         h4.metric("Total 4% crossings", len(hist_events))
         only_accel = hist_events[hist_events["detector_state"] != "NO ACCELERATION"].copy()
-        dcols = ["trading_date","money_flow_rank","symbol","detector_state","time_2pct","time_4pct",
-                 "minutes_2_to_4","oi_4pct","future_move_4pct","exposure_change_4pct_cr","zone_4pct","time_8pct"]
+        only_accel["detection_time"] = only_accel["time_4pct"].apply(time_ist)
+        only_accel["time_2pct_display"] = only_accel["time_2pct"].apply(time_ist)
+        only_accel["time_4pct_display"] = only_accel["time_4pct"].apply(time_ist)
+        only_accel["time_8pct_display"] = only_accel["time_8pct"].apply(time_ist)
+        dcols = ["trading_date","money_flow_rank","symbol","detector_state","detection_time",
+                 "time_2pct_display","time_4pct_display","minutes_2_to_4","oi_4pct",
+                 "future_move_4pct","exposure_change_4pct_cr","zone_4pct","time_8pct_display"]
         st.dataframe(only_accel[[c for c in dcols if c in only_accel.columns]], use_container_width=True, hide_index=True, column_config={
-            "detector_state":"Acceleration", "minutes_2_to_4":"2→4 min",
+            "detector_state":"Acceleration", "detection_time":"Detection Time",
+            "time_2pct_display":"2% Time", "time_4pct_display":"4% Time",
+            "time_8pct_display":"8% Time", "minutes_2_to_4":"2→4 min",
             "oi_4pct":st.column_config.NumberColumn("OI @4%",format="%.2f%%"),
             "future_move_4pct":st.column_config.NumberColumn("Fut @4%",format="%.2f%%"),
             "exposure_change_4pct_cr":st.column_config.NumberColumn("Exposure @4% ₹Cr",format="%.2f"),
