@@ -283,6 +283,246 @@ def load_oi_spurt_stats():
     ))
 
 
+
+OPTION_LEAD_ACCEL_X = 2.0
+OPTION_LEAD_MIN_FRESH_CR = 0.50
+
+
+def load_option_activity_stats():
+    """Aggregate option fresh-value acceleration from stock-engine snapshots.
+
+    Research-only lead flag: current 3m option fresh value >= ₹0.50Cr and >=2x
+    the average of the previous five 3-minute snapshots. This does not alter
+    the core Early Detector signal rules.
+    """
+    sql = """
+    WITH latest_date AS (
+        SELECT MAX(trading_date) AS trading_date
+        FROM public.money_flow_universe
+    ),
+    base AS (
+        SELECT
+            s.symbol,
+            s.ts,
+            COALESCE(s.call_fresh_value_cr,0)::numeric AS call_fresh_cr,
+            COALESCE(s.put_fresh_value_cr,0)::numeric AS put_fresh_cr,
+            (COALESCE(s.call_fresh_value_cr,0) + COALESCE(s.put_fresh_value_cr,0))::numeric AS option_fresh_3m_cr,
+            AVG((COALESCE(s.call_fresh_value_cr,0) + COALESCE(s.put_fresh_value_cr,0))::numeric)
+              OVER (PARTITION BY s.symbol ORDER BY s.ts ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS prior_15m_avg_per_3m_cr,
+            COUNT(*) OVER (PARTITION BY s.symbol ORDER BY s.ts ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS prior_rows,
+            SUM(COALESCE(s.call_fresh_value_cr,0)::numeric)
+              OVER (PARTITION BY s.symbol ORDER BY s.ts ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS call_fresh_15m_cr,
+            SUM(COALESCE(s.put_fresh_value_cr,0)::numeric)
+              OVER (PARTITION BY s.symbol ORDER BY s.ts ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS put_fresh_15m_cr,
+            ROW_NUMBER() OVER (PARTITION BY s.symbol ORDER BY s.ts DESC) AS rn_desc
+        FROM public.stock_engine_snapshots s
+        WHERE (s.ts AT TIME ZONE 'Asia/Kolkata')::date = (SELECT trading_date FROM latest_date)
+    ),
+    calc AS (
+        SELECT *,
+            CASE WHEN prior_rows = 5 AND prior_15m_avg_per_3m_cr > 0
+                 THEN option_fresh_3m_cr / prior_15m_avg_per_3m_cr END AS option_acceleration_x,
+            CASE WHEN prior_rows = 5 AND prior_15m_avg_per_3m_cr > 0
+                       AND option_fresh_3m_cr >= %s
+                       AND (option_fresh_3m_cr / prior_15m_avg_per_3m_cr) >= %s
+                 THEN TRUE ELSE FALSE END AS option_lead_flag
+        FROM base
+    ),
+    agg AS (
+        SELECT
+            symbol,
+            MAX(option_acceleration_x) AS max_option_acceleration_x,
+            MIN(ts) FILTER (WHERE option_lead_flag) AS first_option_lead_time,
+            COUNT(*) FILTER (WHERE option_lead_flag) AS option_lead_count
+        FROM calc
+        GROUP BY symbol
+    ),
+    latest AS (
+        SELECT
+            symbol,
+            ts AS option_activity_ts,
+            option_fresh_3m_cr AS current_option_fresh_3m_cr,
+            prior_15m_avg_per_3m_cr,
+            option_acceleration_x AS current_option_acceleration_x,
+            call_fresh_15m_cr,
+            put_fresh_15m_cr,
+            option_lead_flag AS current_option_lead_flag
+        FROM calc
+        WHERE rn_desc = 1
+    )
+    SELECT l.*, a.max_option_acceleration_x, a.first_option_lead_time, a.option_lead_count
+    FROM latest l
+    LEFT JOIN agg a USING(symbol);
+    """
+    return query_df(sql, (OPTION_LEAD_MIN_FRESH_CR, OPTION_LEAD_ACCEL_X))
+
+
+def option_snapshot_table_exists():
+    sql = """
+    SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema='public' AND table_name='money_flow_option_snapshots'
+    ) AS exists;
+    """
+    df = query_df(sql)
+    return bool(not df.empty and df.iloc[0].get("exists"))
+
+
+def load_latest_option_contracts():
+    """Latest frozen six-option snapshot per stock, with a dominant contract.
+
+    Dominance is research-only and ranked by absolute premium-weighted OI change:
+    |ΔOI_3m × LTP|. This is an approximate intensity score, not literal cash flow.
+    """
+    if not option_snapshot_table_exists():
+        return pd.DataFrame()
+    sql = """
+    WITH latest_date AS (
+        SELECT MAX(trading_date) AS trading_date
+        FROM public.money_flow_universe
+    ),
+    latest_ts AS (
+        SELECT symbol, MAX(ts) AS ts
+        FROM public.money_flow_option_snapshots
+        WHERE trading_date = (SELECT trading_date FROM latest_date)
+        GROUP BY symbol
+    ),
+    six AS (
+        SELECT
+            o.*,
+            ABS(COALESCE(o.oi_change_3m,0)::numeric * COALESCE(o.ltp,0)::numeric) AS premium_oi_intensity,
+            ROW_NUMBER() OVER (
+                PARTITION BY o.symbol
+                ORDER BY ABS(COALESCE(o.oi_change_3m,0)::numeric * COALESCE(o.ltp,0)::numeric) DESC,
+                         ABS(COALESCE(o.oi_change_3m,0)) DESC,
+                         o.option_type, o.wing_no
+            ) AS intensity_rank
+        FROM public.money_flow_option_snapshots o
+        JOIN latest_ts t ON t.symbol=o.symbol AND t.ts=o.ts
+        WHERE o.trading_date = (SELECT trading_date FROM latest_date)
+    )
+    SELECT
+        symbol,
+        ts AS option_snapshot_ts,
+        option_type AS dominant_option_type,
+        wing_no AS dominant_wing_no,
+        strike AS dominant_strike,
+        ltp AS dominant_ltp,
+        opening_ltp AS dominant_opening_ltp,
+        price_multiple AS dominant_price_multiple,
+        doubled AS dominant_doubled,
+        oi AS dominant_oi,
+        oi_change_3m AS dominant_oi_change_3m,
+        iv AS dominant_iv,
+        delta AS dominant_delta,
+        premium_oi_intensity AS dominant_premium_oi_intensity
+    FROM six
+    WHERE intensity_rank=1;
+    """
+    return query_df(sql)
+
+
+
+def load_dominant_option_at_first_spurt():
+    """Exact frozen contract with the largest |ΔOI × LTP| at the first >=0.50% futures OI spurt."""
+    if not option_snapshot_table_exists():
+        return pd.DataFrame()
+    sql = """
+    WITH latest_date AS (
+        SELECT MAX(trading_date) AS trading_date FROM public.money_flow_universe
+    ),
+    spurts AS (
+        SELECT
+            s.symbol, s.ts,
+            CASE WHEN (s.future_oi-s.future_oi_change_3m) <> 0
+                 THEN s.future_oi_change_3m::numeric / NULLIF((s.future_oi-s.future_oi_change_3m),0) * 100 END AS oi_spurt_pct
+        FROM public.stock_engine_snapshots s
+        WHERE (s.ts AT TIME ZONE 'Asia/Kolkata')::date=(SELECT trading_date FROM latest_date)
+    ),
+    first_spurt AS (
+        SELECT symbol, MIN(ts) AS first_spurt_ts
+        FROM spurts
+        WHERE oi_spurt_pct >= %s
+        GROUP BY symbol
+    ),
+    ranked AS (
+        SELECT
+            o.symbol, f.first_spurt_ts,
+            o.option_type, o.wing_no, o.strike, o.ltp, o.opening_ltp, o.price_multiple,
+            o.oi_change_3m, o.iv, o.doubled,
+            ABS(COALESCE(o.oi_change_3m,0)::numeric * COALESCE(o.ltp,0)::numeric) AS intensity,
+            ROW_NUMBER() OVER (
+                PARTITION BY o.symbol
+                ORDER BY ABS(COALESCE(o.oi_change_3m,0)::numeric * COALESCE(o.ltp,0)::numeric) DESC,
+                         ABS(COALESCE(o.oi_change_3m,0)) DESC,
+                         o.option_type, o.wing_no
+            ) AS rn
+        FROM public.money_flow_option_snapshots o
+        JOIN first_spurt f ON f.symbol=o.symbol AND f.first_spurt_ts=o.ts
+        WHERE o.trading_date=(SELECT trading_date FROM latest_date)
+    )
+    SELECT
+        symbol,
+        first_spurt_ts AS option_spurt_time,
+        option_type AS spurt_dominant_option_type,
+        wing_no AS spurt_dominant_wing_no,
+        strike AS spurt_dominant_strike,
+        ltp AS spurt_dominant_ltp,
+        opening_ltp AS spurt_dominant_opening_ltp,
+        price_multiple AS spurt_dominant_price_multiple,
+        oi_change_3m AS spurt_dominant_oi_change_3m,
+        iv AS spurt_dominant_iv,
+        doubled AS spurt_dominant_doubled
+    FROM ranked
+    WHERE rn=1;
+    """
+    return query_df(sql, (OI_SPURT_PCT,))
+
+
+def load_first_option_doubles():
+    """First frozen option to reach 2x opening premium for each stock on latest day."""
+    if not option_snapshot_table_exists():
+        return pd.DataFrame()
+    sql = """
+    WITH latest_date AS (
+        SELECT MAX(trading_date) AS trading_date
+        FROM public.money_flow_universe
+    ),
+    firsts AS (
+        SELECT DISTINCT ON (symbol)
+            symbol, ts, option_type, wing_no, strike, opening_ltp, ltp, price_multiple
+        FROM public.money_flow_option_snapshots
+        WHERE trading_date=(SELECT trading_date FROM latest_date)
+          AND doubled=TRUE
+        ORDER BY symbol, ts, price_multiple DESC
+    )
+    SELECT
+        symbol,
+        ts AS first_option_2x_time,
+        option_type AS first_2x_option_type,
+        wing_no AS first_2x_wing_no,
+        strike AS first_2x_strike,
+        opening_ltp AS first_2x_opening_ltp,
+        ltp AS first_2x_ltp,
+        price_multiple AS first_2x_multiple
+    FROM firsts;
+    """
+    return query_df(sql)
+
+
+def load_symbol_option_history(symbol, limit=120):
+    if not option_snapshot_table_exists():
+        return pd.DataFrame()
+    sql = """
+    SELECT *
+    FROM public.money_flow_option_snapshots
+    WHERE symbol=%s
+    ORDER BY ts DESC, option_type, wing_no
+    LIMIT %s;
+    """
+    return query_df(sql, (symbol, limit))
+
 def load_early_detector_history(days=31):
     """Reconstruct v1.0 acceleration events from existing Neon snapshots."""
     sql = """
@@ -440,14 +680,14 @@ def build_master_score(df):
 
 
 # ============================================================
-# EARLY DETECTOR v1.2 — OI SPURT LAYER
+# EARLY DETECTOR v1.3 — OI SPURT + OPTION LEAD LAYER
 # ============================================================
 
 ACCELERATION_MINUTES = 30
 
 
 def build_early_detector(df):
-    """v1.2 research rules: OI Spurt warning + frozen 2→4 acceleration framework."""
+    """v1.3 research rules: option-lead observation + OI Spurt warning + frozen 2→4 acceleration framework."""
     if df.empty:
         return df
     out = df.copy()
@@ -455,7 +695,10 @@ def build_early_detector(df):
         "future_oi_change_pct_t0", "future_oi_change_3m", "future", "future_oi",
         "future_930", "oi_930", "futures_value_930_cr", "spot", "spot_930",
         "minutes_2_to_4", "minutes_4_to_8", "future_4pct", "future_oi_4pct",
-        "current_spurt_pct", "max_spurt_pct", "spurt_count", "strong_spurt_count"
+        "current_spurt_pct", "max_spurt_pct", "spurt_count", "strong_spurt_count",
+        "current_option_fresh_3m_cr", "prior_15m_avg_per_3m_cr", "current_option_acceleration_x",
+        "max_option_acceleration_x", "option_lead_count", "dominant_price_multiple",
+        "dominant_oi_change_3m", "dominant_iv"
     ]
     for col in numeric_cols:
         if col in out.columns:
@@ -512,6 +755,20 @@ def build_early_detector(df):
         if zone in bearish_zones and fut_move <= 0: return "⚠️ BEARISH ZONE WATCH"
         if zone in bullish_zones and fut_move >= 0: return "👀 BULLISH ZONE WATCH"
         return "— NEUTRAL"
+
+    # Research timeline deltas. Negative/blank values are left as NA.
+    if "first_option_lead_time" in out.columns and "first_spurt_time" in out.columns:
+        lead = pd.to_datetime(out["first_option_lead_time"], utc=True, errors="coerce")
+        spurt = pd.to_datetime(out["first_spurt_time"], utc=True, errors="coerce")
+        out["option_lead_to_spurt_min"] = (spurt - lead).dt.total_seconds() / 60.0
+    if "first_spurt_time" in out.columns and "time_4pct" in out.columns:
+        spurt = pd.to_datetime(out["first_spurt_time"], utc=True, errors="coerce")
+        accel = pd.to_datetime(out["time_4pct"], utc=True, errors="coerce")
+        out["spurt_to_accel_min"] = (accel - spurt).dt.total_seconds() / 60.0
+    if "time_4pct" in out.columns and "first_option_2x_time" in out.columns:
+        accel = pd.to_datetime(out["time_4pct"], utc=True, errors="coerce")
+        double = pd.to_datetime(out["first_option_2x_time"], utc=True, errors="coerce")
+        out["accel_to_option_2x_min"] = (double - accel).dt.total_seconds() / 60.0
 
     out["oi_stage"] = out["future_oi_change_pct_t0"].apply(oi_stage)
     out["acceleration_state"] = out.apply(acceleration_state, axis=1)
@@ -582,13 +839,17 @@ def time_ist(v):
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v1.2")
-st.caption("Neon-backed dashboard • OI Spurt → Acceleration → Strong buildup across all Top-20 stocks.")
+st.title("Top 20 Money Flow — Early Detector v1.3")
+st.caption("Neon-backed dashboard • Option Lead → OI Spurt → Acceleration → Option 2× across all Top-20 stocks.")
 
 universe = load_universe()
 latest = build_master_score(load_latest_snapshots())
 milestones = load_oi_milestones() if not universe.empty else pd.DataFrame()
 spurt_stats = load_oi_spurt_stats() if not universe.empty else pd.DataFrame()
+option_activity = load_option_activity_stats() if not universe.empty else pd.DataFrame()
+dominant_options = load_latest_option_contracts() if not universe.empty else pd.DataFrame()
+spurt_dominant_options = load_dominant_option_at_first_spurt() if not universe.empty else pd.DataFrame()
+option_doubles = load_first_option_doubles() if not universe.empty else pd.DataFrame()
 
 if not latest.empty and not universe.empty:
     baseline = universe[["symbol", "spot_price", "future_price", "future_oi", "futures_value_cr"]].rename(
@@ -603,6 +864,14 @@ if not latest.empty and not universe.empty:
         latest = latest.merge(milestones[[c for c in keep if c in milestones.columns]], on="symbol", how="left")
     if not spurt_stats.empty:
         latest = latest.merge(spurt_stats, on="symbol", how="left")
+    if not option_activity.empty:
+        latest = latest.merge(option_activity, on="symbol", how="left")
+    if not dominant_options.empty:
+        latest = latest.merge(dominant_options, on="symbol", how="left")
+    if not spurt_dominant_options.empty:
+        latest = latest.merge(spurt_dominant_options, on="symbol", how="left")
+    if not option_doubles.empty:
+        latest = latest.merge(option_doubles, on="symbol", how="left")
     latest = build_early_detector(latest)
 
 if universe.empty:
@@ -626,7 +895,7 @@ if latest.empty:
         "Once the 3-minute collector starts writing, the two dashboards will populate automatically."
     )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Master", "Early Detector", "30-Day Monitor", "Liquidity", "Stock detail"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Master", "Early Detector", "Option Lead", "30-Day Monitor", "Liquidity", "Stock detail"])
 
 # ---------------- MASTER ----------------
 with tab1:
@@ -714,7 +983,7 @@ with tab1:
 
 # ---------------- EARLY DETECTOR ----------------
 with tab2:
-    st.subheader("Early Detector v1.2 — OI Spurt")
+    st.subheader("Early Detector v1.3 — OI Spurt")
     st.caption("Study rules: 3m futures OI >=0.50% = SPURT; >=1.00% = STRONG SPURT. Acceleration remains first +2%→+4% in <=30 min. Final progression: WATCH → OI SPURT → ACCELERATING → STRONG.")
 
     if not latest.empty:
@@ -765,8 +1034,12 @@ with tab2:
         else:
             st.info("No Accelerating Long/Short state has qualified yet on the latest trading day.")
 
-        cols = ["money_flow_rank","symbol","build_state","current_spurt_state","current_spurt_pct",
-                "spurt_count","max_spurt_pct","first_spurt_time","time_4pct","time_2pct","minutes_2_to_4",
+        cols = ["money_flow_rank","symbol","build_state",
+                "current_option_acceleration_x","current_option_fresh_3m_cr","first_option_lead_time",
+                "dominant_option_type","dominant_strike","dominant_wing_no","dominant_price_multiple","dominant_oi_change_3m",
+                "current_spurt_state","current_spurt_pct","spurt_count","max_spurt_pct","first_spurt_time",
+                "time_4pct","time_2pct","minutes_2_to_4","first_option_2x_time",
+                "option_lead_to_spurt_min","spurt_to_accel_min","accel_to_option_2x_min",
                 "oi_stage","future_oi_change_pct_t0","future_price_change_from_930_pct",
                 "futures_exposure_change_cr","minutes_4_to_8","future_move_at_4pct",
                 "exposure_at_4pct_cr","zone_state","next_zone"]
@@ -777,18 +1050,36 @@ with tab2:
             view["time_2pct"] = view["time_2pct"].apply(time_ist)
         if "first_spurt_time" in view:
             view["first_spurt_time"] = view["first_spurt_time"].apply(time_ist)
-        for c in ["current_spurt_pct","max_spurt_pct","future_oi_change_pct_t0","future_price_change_from_930_pct","futures_exposure_change_cr",
-                  "minutes_2_to_4","minutes_4_to_8","future_move_at_4pct","exposure_at_4pct_cr"]:
+        if "first_option_lead_time" in view:
+            view["first_option_lead_time"] = view["first_option_lead_time"].apply(time_ist)
+        if "first_option_2x_time" in view:
+            view["first_option_2x_time"] = view["first_option_2x_time"].apply(time_ist)
+        for c in ["current_option_acceleration_x","current_option_fresh_3m_cr","dominant_price_multiple",
+                  "current_spurt_pct","max_spurt_pct","future_oi_change_pct_t0","future_price_change_from_930_pct","futures_exposure_change_cr",
+                  "minutes_2_to_4","minutes_4_to_8","future_move_at_4pct","exposure_at_4pct_cr",
+                  "option_lead_to_spurt_min","spurt_to_accel_min","accel_to_option_2x_min"]:
             if c in view: view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
         st.markdown("### All Top-20 stocks")
         st.dataframe(view, use_container_width=True, hide_index=True, column_config={
             "money_flow_rank":"Rank", "symbol":"Symbol", "build_state":"Build State",
+            "current_option_acceleration_x":st.column_config.NumberColumn("Option Accel ×",format="%.2f"),
+            "current_option_fresh_3m_cr":st.column_config.NumberColumn("Option Fresh 3m ₹Cr",format="%.2f"),
+            "first_option_lead_time":"Option Lead Time",
+            "dominant_option_type":"Dominant Type",
+            "dominant_strike":st.column_config.NumberColumn("Dominant Strike",format="%.0f"),
+            "dominant_wing_no":st.column_config.NumberColumn("Wing",format="%.0f"),
+            "dominant_price_multiple":st.column_config.NumberColumn("Dominant LTP ×",format="%.2f"),
+            "dominant_oi_change_3m":st.column_config.NumberColumn("Dominant ΔOI 3m",format="%.0f"),
             "current_spurt_state":"Current Spurt",
             "current_spurt_pct":st.column_config.NumberColumn("3m OI Spurt",format="%.3f%%"),
             "spurt_count":st.column_config.NumberColumn("Spurt Count",format="%.0f"),
             "max_spurt_pct":st.column_config.NumberColumn("Max Spurt",format="%.3f%%"),
             "first_spurt_time":"First Spurt",
-            "time_4pct":"Detection Time", "time_2pct":"2% Time", "oi_stage":"OI Stage",
+            "time_4pct":"Detection Time", "time_2pct":"2% Time", "first_option_2x_time":"First Option 2×",
+            "option_lead_to_spurt_min":st.column_config.NumberColumn("Lead→Spurt min",format="%.0f"),
+            "spurt_to_accel_min":st.column_config.NumberColumn("Spurt→Accel min",format="%.0f"),
+            "accel_to_option_2x_min":st.column_config.NumberColumn("Accel→2× min",format="%.0f"),
+            "oi_stage":"OI Stage",
             "future_oi_change_pct_t0":st.column_config.NumberColumn("OI vs 09:30",format="%.2f%%"),
             "future_price_change_from_930_pct":st.column_config.NumberColumn("Fut vs 09:30",format="%.2f%%"),
             "futures_exposure_change_cr":st.column_config.NumberColumn("Exposure Δ ₹Cr",format="%.2f"),
@@ -800,8 +1091,82 @@ with tab2:
         })
         st.markdown('<div class="small-note">OI Spurt v1.0 threshold is frozen at 0.50% (strong at 1.00%) for the one-month study. The existing 2→4 acceleration rule is unchanged.</div>', unsafe_allow_html=True)
 
-# ---------------- 30-DAY MONITOR ----------------
+# ---------------- OPTION LEAD ----------------
 with tab3:
+    st.subheader("Option Lead — Frozen 3CE + 3PE")
+    st.caption(
+        "Research view only. Aggregate option acceleration uses Call Fresh + Put Fresh from the stock engine. "
+        "The dominant exact contract is selected from today's frozen six-option table by |3m ΔOI × LTP|. "
+        "That is an approximate intensity ranking, not literal cash flow."
+    )
+
+    if latest.empty:
+        st.info("No current stock snapshots are available yet.")
+    elif dominant_options.empty:
+        st.info("The individual option table exists but has no rows yet. It should populate after the v3.4 collector freezes today's Top-20 and begins 3-minute writes.")
+    else:
+        opt = latest.sort_values(["current_option_acceleration_x","money_flow_rank"], ascending=[False,True]).copy()
+
+        lead_now = int((opt.get("current_option_lead_flag", pd.Series(False, index=opt.index)).fillna(False) == True).sum())
+        doubled_now = int((opt.get("dominant_doubled", pd.Series(False, index=opt.index)).fillna(False) == True).sum())
+        q1,q2,q3,q4 = st.columns(4)
+        q1.metric("Research Option Leads now", lead_now)
+        q2.metric("Stocks with a 2× option", int(opt.get("first_option_2x_time", pd.Series(dtype=object)).notna().sum()))
+        q3.metric("Dominant option doubled now", doubled_now)
+        q4.metric("Frozen option stocks", dominant_options["symbol"].nunique())
+
+        st.markdown("### Current option activity + dominant contract")
+        ocols = [
+            "money_flow_rank","symbol","current_option_acceleration_x","current_option_fresh_3m_cr",
+            "call_fresh_15m_cr","put_fresh_15m_cr","first_option_lead_time","option_lead_count",
+            "dominant_option_type","dominant_strike","dominant_wing_no","dominant_ltp","dominant_opening_ltp",
+            "dominant_price_multiple","dominant_oi_change_3m","dominant_iv",
+            "spurt_dominant_option_type","spurt_dominant_strike","spurt_dominant_wing_no",
+            "spurt_dominant_price_multiple","spurt_dominant_oi_change_3m","first_option_2x_time",
+            "first_2x_option_type","first_2x_strike","first_2x_multiple","first_spurt_time","time_4pct",
+            "option_lead_to_spurt_min","spurt_to_accel_min","accel_to_option_2x_min"
+        ]
+        ov = opt[[c for c in ocols if c in opt.columns]].copy()
+        for c in ["first_option_lead_time","first_option_2x_time","first_spurt_time","time_4pct"]:
+            if c in ov: ov[c] = ov[c].apply(time_ist)
+        for c in ["current_option_acceleration_x","current_option_fresh_3m_cr","call_fresh_15m_cr","put_fresh_15m_cr",
+                  "dominant_ltp","dominant_opening_ltp","dominant_price_multiple","dominant_iv",
+                  "spurt_dominant_price_multiple","first_2x_multiple",
+                  "option_lead_to_spurt_min","spurt_to_accel_min","accel_to_option_2x_min"]:
+            if c in ov: ov[c] = pd.to_numeric(ov[c], errors="coerce").round(2)
+        st.dataframe(ov, use_container_width=True, hide_index=True, column_config={
+            "money_flow_rank":"Rank", "symbol":"Symbol",
+            "current_option_acceleration_x":st.column_config.NumberColumn("Option Accel ×",format="%.2f"),
+            "current_option_fresh_3m_cr":st.column_config.NumberColumn("Fresh 3m ₹Cr",format="%.2f"),
+            "call_fresh_15m_cr":st.column_config.NumberColumn("Call Fresh 15m ₹Cr",format="%.2f"),
+            "put_fresh_15m_cr":st.column_config.NumberColumn("Put Fresh 15m ₹Cr",format="%.2f"),
+            "first_option_lead_time":"Option Lead", "option_lead_count":"Lead Count",
+            "dominant_option_type":"Dominant", "dominant_strike":"Strike", "dominant_wing_no":"Wing",
+            "dominant_ltp":st.column_config.NumberColumn("LTP",format="%.2f"),
+            "dominant_opening_ltp":st.column_config.NumberColumn("Open LTP",format="%.2f"),
+            "dominant_price_multiple":st.column_config.NumberColumn("LTP ×",format="%.2f"),
+            "dominant_oi_change_3m":st.column_config.NumberColumn("ΔOI 3m",format="%.0f"),
+            "dominant_iv":st.column_config.NumberColumn("IV",format="%.3f"),
+            "spurt_dominant_option_type":"At Spurt Type",
+            "spurt_dominant_strike":"At Spurt Strike",
+            "spurt_dominant_wing_no":"At Spurt Wing",
+            "spurt_dominant_price_multiple":st.column_config.NumberColumn("At Spurt LTP ×",format="%.2f"),
+            "spurt_dominant_oi_change_3m":st.column_config.NumberColumn("At Spurt ΔOI",format="%.0f"),
+            "first_option_2x_time":"First 2×", "first_2x_option_type":"2× Type", "first_2x_strike":"2× Strike",
+            "first_2x_multiple":st.column_config.NumberColumn("2× Multiple",format="%.2f"),
+            "first_spurt_time":"OI Spurt", "time_4pct":"Acceleration",
+            "option_lead_to_spurt_min":st.column_config.NumberColumn("Lead→Spurt min",format="%.0f"),
+            "spurt_to_accel_min":st.column_config.NumberColumn("Spurt→Accel min",format="%.0f"),
+            "accel_to_option_2x_min":st.column_config.NumberColumn("Accel→2× min",format="%.0f"),
+        })
+
+        st.markdown(
+            '<div class="small-note">Research Option Lead is observational only: current 3-minute aggregate option fresh value ≥ ₹0.50Cr and ≥2× its previous-five-snapshot average. It does not alter the OI-spurt or acceleration signal.</div>',
+            unsafe_allow_html=True,
+        )
+
+# ---------------- 30-DAY MONITOR ----------------
+with tab4:
     st.subheader("30-Day Early Detector Monitor")
     st.caption("Reconstructed from existing Neon snapshots; no Railway collector change required.")
     hist_events = load_early_detector_history(31)
@@ -834,7 +1199,7 @@ with tab3:
         })
 
 # ---------------- LIQUIDITY ----------------
-with tab4:
+with tab5:
     st.subheader("Liquidity Dashboard")
 
     if not latest.empty:
@@ -864,7 +1229,7 @@ with tab4:
             )
 
 # ---------------- DETAIL ----------------
-with tab5:
+with tab6:
     st.subheader("Stock detail")
 
     symbols = universe.sort_values("rank")["symbol"].tolist()
@@ -894,6 +1259,15 @@ with tab5:
         sp2.metric("Spurt State", str(r.get("current_spurt_state","-")))
         sp3.metric("Spurt Count", integer(r.get("spurt_count")))
         sp4.metric("First Spurt", time_ist(r.get("first_spurt_time")))
+
+        op1,op2,op3,op4 = st.columns(4)
+        dom_label = "-"
+        if pd.notna(r.get("dominant_strike")):
+            dom_label = f"{int(float(r.get('dominant_strike')))} {r.get('dominant_option_type','')}"
+        op1.metric("Option Accel ×", num(r.get("current_option_acceleration_x"),2))
+        op2.metric("Option Fresh 3m ₹Cr", num(r.get("current_option_fresh_3m_cr"),2))
+        op3.metric("Dominant Option", dom_label)
+        op4.metric("Dominant LTP ×", num(r.get("dominant_price_multiple"),2))
 
         z1, z2, z3, z4 = st.columns(4)
         z1.metric("Call IV", iv_pct(r.get("call_iv")))
@@ -940,6 +1314,27 @@ with tab5:
                 hist[history_cols].sort_values("ts", ascending=False),
                 use_container_width=True,
                 hide_index=True,
+            )
+
+
+        option_hist = load_symbol_option_history(selected, 120)
+        if not option_hist.empty:
+            option_hist = option_hist.copy()
+            option_hist["time_ist"] = option_hist["ts"].apply(time_ist)
+            show_opt = ["time_ist","option_type","wing_no","strike","ltp","opening_ltp","price_multiple","doubled","oi_change_3m","iv"]
+            st.markdown("#### Frozen six-option history")
+            st.dataframe(
+                option_hist[[c for c in show_opt if c in option_hist.columns]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "time_ist":"Time", "option_type":"Type", "wing_no":"Wing", "strike":"Strike",
+                    "ltp":st.column_config.NumberColumn("LTP",format="%.2f"),
+                    "opening_ltp":st.column_config.NumberColumn("Open LTP",format="%.2f"),
+                    "price_multiple":st.column_config.NumberColumn("Multiple",format="%.2f"),
+                    "doubled":"2×", "oi_change_3m":st.column_config.NumberColumn("ΔOI 3m",format="%.0f"),
+                    "iv":st.column_config.NumberColumn("IV",format="%.3f"),
+                }
             )
     else:
         st.info("No 3-minute snapshot exists yet for this stock.")
