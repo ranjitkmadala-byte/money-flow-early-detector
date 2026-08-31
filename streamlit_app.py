@@ -195,6 +195,94 @@ def load_oi_milestones():
     return query_df(sql)
 
 
+
+OI_SPURT_PCT = 0.50
+OI_STRONG_SPURT_PCT = 1.00
+
+
+def load_oi_spurt_stats():
+    """Live + intraday OI-spurt statistics for the latest trading day."""
+    sql = """
+    WITH latest_date AS (
+        SELECT MAX(trading_date) AS trading_date
+        FROM public.money_flow_universe
+    ),
+    base AS (
+        SELECT
+            s.symbol,
+            s.ts,
+            s.future,
+            s.future_oi,
+            s.future_oi_change_3m,
+            u.future_price AS future_930,
+            CASE
+                WHEN (s.future_oi - s.future_oi_change_3m) <> 0
+                THEN (s.future_oi_change_3m::numeric /
+                      NULLIF((s.future_oi - s.future_oi_change_3m),0)) * 100
+            END AS oi_spurt_3m_pct,
+            ((s.future / NULLIF(u.future_price,0)) - 1) * 100 AS future_vs_930_pct,
+            ROW_NUMBER() OVER (PARTITION BY s.symbol ORDER BY s.ts DESC) AS rn_desc
+        FROM public.stock_engine_snapshots s
+        JOIN public.money_flow_universe u
+          ON u.symbol = s.symbol
+         AND u.trading_date = (s.ts AT TIME ZONE 'Asia/Kolkata')::date
+        WHERE u.trading_date = (SELECT trading_date FROM latest_date)
+    ),
+    agg AS (
+        SELECT
+            symbol,
+            COUNT(*) FILTER (WHERE oi_spurt_3m_pct >= %s) AS spurt_count,
+            COUNT(*) FILTER (WHERE oi_spurt_3m_pct >= %s) AS strong_spurt_count,
+            MAX(oi_spurt_3m_pct) AS max_spurt_pct,
+            MIN(ts) FILTER (WHERE oi_spurt_3m_pct >= %s) AS first_spurt_time,
+            MIN(ts) FILTER (
+                WHERE oi_spurt_3m_pct >= %s AND future_vs_930_pct > 0
+            ) AS first_long_spurt_time,
+            MIN(ts) FILTER (
+                WHERE oi_spurt_3m_pct >= %s AND future_vs_930_pct < 0
+            ) AS first_short_spurt_time
+        FROM base
+        GROUP BY symbol
+    ),
+    latest AS (
+        SELECT
+            symbol,
+            ts AS spurt_snapshot_time,
+            oi_spurt_3m_pct AS current_spurt_pct,
+            future_vs_930_pct AS spurt_future_vs_930_pct,
+            CASE
+              WHEN oi_spurt_3m_pct >= %s AND future_vs_930_pct > 0 THEN 'STRONG LONG SPURT'
+              WHEN oi_spurt_3m_pct >= %s AND future_vs_930_pct < 0 THEN 'STRONG SHORT SPURT'
+              WHEN oi_spurt_3m_pct >= %s AND future_vs_930_pct > 0 THEN 'LONG SPURT'
+              WHEN oi_spurt_3m_pct >= %s AND future_vs_930_pct < 0 THEN 'SHORT SPURT'
+              ELSE 'NO CURRENT SPURT'
+            END AS current_spurt_state
+        FROM base
+        WHERE rn_desc = 1
+    )
+    SELECT
+        a.symbol,
+        COALESCE(a.spurt_count,0) AS spurt_count,
+        COALESCE(a.strong_spurt_count,0) AS strong_spurt_count,
+        a.max_spurt_pct,
+        a.first_spurt_time,
+        a.first_long_spurt_time,
+        a.first_short_spurt_time,
+        l.spurt_snapshot_time,
+        l.current_spurt_pct,
+        l.spurt_future_vs_930_pct,
+        l.current_spurt_state
+    FROM agg a
+    JOIN latest l USING(symbol);
+    """
+    return query_df(sql, (
+        OI_SPURT_PCT, OI_STRONG_SPURT_PCT,
+        OI_SPURT_PCT, OI_SPURT_PCT, OI_SPURT_PCT,
+        OI_STRONG_SPURT_PCT, OI_STRONG_SPURT_PCT,
+        OI_SPURT_PCT, OI_SPURT_PCT,
+    ))
+
+
 def load_early_detector_history(days=31):
     """Reconstruct v1.0 acceleration events from existing Neon snapshots."""
     sql = """
@@ -352,21 +440,22 @@ def build_master_score(df):
 
 
 # ============================================================
-# EARLY DETECTOR v1.0
+# EARLY DETECTOR v1.2 — OI SPURT LAYER
 # ============================================================
 
 ACCELERATION_MINUTES = 30
 
 
 def build_early_detector(df):
-    """Frozen v1.0 research rules for the one-month observation window."""
+    """v1.2 research rules: OI Spurt warning + frozen 2→4 acceleration framework."""
     if df.empty:
         return df
     out = df.copy()
     numeric_cols = [
         "future_oi_change_pct_t0", "future_oi_change_3m", "future", "future_oi",
         "future_930", "oi_930", "futures_value_930_cr", "spot", "spot_930",
-        "minutes_2_to_4", "minutes_4_to_8", "future_4pct", "future_oi_4pct"
+        "minutes_2_to_4", "minutes_4_to_8", "future_4pct", "future_oi_4pct",
+        "current_spurt_pct", "max_spurt_pct", "spurt_count", "strong_spurt_count"
     ]
     for col in numeric_cols:
         if col in out.columns:
@@ -392,17 +481,30 @@ def build_early_detector(df):
     bearish_zones = {"BELOW STRONG DEMAND", "WEAK DEMAND BROKEN", "STRONG DEMAND"}
     bullish_zones = {"ABOVE DPOC", "WEAK SUPPLY", "WEAK SUPPLY BROKEN", "STRONG SUPPLY"}
 
-    def state(row):
+    def acceleration_state(row):
         mins = row.get("minutes_2_to_4")
         f4 = row.get("future_move_at_4pct")
         if pd.notna(mins) and mins <= ACCELERATION_MINUTES and pd.notna(f4):
-            if f4 > 0: return "🟢 ACCELERATING LONG"
-            if f4 < 0: return "🔴 ACCELERATING SHORT"
+            if f4 > 0: return "ACCELERATING LONG"
+            if f4 < 0: return "ACCELERATING SHORT"
+        return "NO ACCELERATION"
+
+    def state(row):
         oi = float(row.get("future_oi_change_pct_t0") or 0)
         fut_move = float(row.get("future_price_change_from_930_pct") or 0)
         zone = str(row.get("zone_state") or "").upper()
+        accel = row.get("acceleration_state")
+        spurt = str(row.get("current_spurt_state") or "NO CURRENT SPURT")
+
+        # Final progression: WATCH -> OI SPURT -> ACCELERATING -> STRONG.
         if oi >= 8 and fut_move > 0: return "🟢 STRONG LONG BUILD"
         if oi >= 8 and fut_move < 0: return "🔴 STRONG SHORT BUILD"
+        if accel == "ACCELERATING LONG": return "🟢 ACCELERATING LONG"
+        if accel == "ACCELERATING SHORT": return "🔴 ACCELERATING SHORT"
+        if spurt == "STRONG LONG SPURT": return "🔥 STRONG LONG OI SPURT"
+        if spurt == "STRONG SHORT SPURT": return "🔥 STRONG SHORT OI SPURT"
+        if spurt == "LONG SPURT": return "⚡ LONG OI SPURT"
+        if spurt == "SHORT SPURT": return "⚡ SHORT OI SPURT"
         if oi >= 4 and fut_move > 0: return "🟢 BUILDING LONG"
         if oi >= 4 and fut_move < 0: return "🔴 BUILDING SHORT"
         if oi >= 2 and fut_move > 0: return "🟡 WATCH LONG"
@@ -412,13 +514,16 @@ def build_early_detector(df):
         return "— NEUTRAL"
 
     out["oi_stage"] = out["future_oi_change_pct_t0"].apply(oi_stage)
+    out["acceleration_state"] = out.apply(acceleration_state, axis=1)
     out["build_state"] = out.apply(state, axis=1)
     priority = {
-        "🔴 ACCELERATING SHORT":0, "🟢 ACCELERATING LONG":1,
-        "🔴 STRONG SHORT BUILD":2, "🟢 STRONG LONG BUILD":3,
-        "🔴 BUILDING SHORT":4, "🟢 BUILDING LONG":5,
-        "🟡 WATCH SHORT":6, "🟡 WATCH LONG":7,
-        "⚠️ BEARISH ZONE WATCH":8, "👀 BULLISH ZONE WATCH":9, "— NEUTRAL":10
+        "🔴 STRONG SHORT BUILD":0, "🟢 STRONG LONG BUILD":1,
+        "🔴 ACCELERATING SHORT":2, "🟢 ACCELERATING LONG":3,
+        "🔥 STRONG SHORT OI SPURT":4, "🔥 STRONG LONG OI SPURT":5,
+        "⚡ SHORT OI SPURT":6, "⚡ LONG OI SPURT":7,
+        "🔴 BUILDING SHORT":8, "🟢 BUILDING LONG":9,
+        "🟡 WATCH SHORT":10, "🟡 WATCH LONG":11,
+        "⚠️ BEARISH ZONE WATCH":12, "👀 BULLISH ZONE WATCH":13, "— NEUTRAL":14
     }
     out["build_priority"] = out["build_state"].map(priority).fillna(99)
     return out
@@ -477,12 +582,13 @@ def time_ist(v):
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v1.0")
-st.caption("Neon-backed dashboard • Accelerating Long/Short buildup highlighted across all Top-20 stocks.")
+st.title("Top 20 Money Flow — Early Detector v1.2")
+st.caption("Neon-backed dashboard • OI Spurt → Acceleration → Strong buildup across all Top-20 stocks.")
 
 universe = load_universe()
 latest = build_master_score(load_latest_snapshots())
 milestones = load_oi_milestones() if not universe.empty else pd.DataFrame()
+spurt_stats = load_oi_spurt_stats() if not universe.empty else pd.DataFrame()
 
 if not latest.empty and not universe.empty:
     baseline = universe[["symbol", "spot_price", "future_price", "future_oi", "futures_value_cr"]].rename(
@@ -495,6 +601,8 @@ if not latest.empty and not universe.empty:
                 "time_8pct","oi_8pct","future_8pct","future_oi_8pct",
                 "minutes_2_to_4","minutes_4_to_8"]
         latest = latest.merge(milestones[[c for c in keep if c in milestones.columns]], on="symbol", how="left")
+    if not spurt_stats.empty:
+        latest = latest.merge(spurt_stats, on="symbol", how="left")
     latest = build_early_detector(latest)
 
 if universe.empty:
@@ -606,26 +714,40 @@ with tab1:
 
 # ---------------- EARLY DETECTOR ----------------
 with tab2:
-    st.subheader("Early Detector v1.0")
-    st.caption("Frozen for one month: +2% WATCH, +4% BUILDING, +8% STRONG. ACCELERATING = first +2% to +4% in <=30 minutes; futures direction at +4% defines LONG or SHORT.")
+    st.subheader("Early Detector v1.2 — OI Spurt")
+    st.caption("Study rules: 3m futures OI >=0.50% = SPURT; >=1.00% = STRONG SPURT. Acceleration remains first +2%→+4% in <=30 min. Final progression: WATCH → OI SPURT → ACCELERATING → STRONG.")
 
     if not latest.empty:
         early = latest.sort_values(["build_priority", "money_flow_rank"], ascending=[True, True]).copy()
-        accel_long = int((early["build_state"] == "🟢 ACCELERATING LONG").sum())
-        accel_short = int((early["build_state"] == "🔴 ACCELERATING SHORT").sum())
-        active_2 = int((pd.to_numeric(early["future_oi_change_pct_t0"], errors="coerce") >= 2).sum())
-        active_8 = int((pd.to_numeric(early["future_oi_change_pct_t0"], errors="coerce") >= 8).sum())
+        accel_long = int((early["acceleration_state"] == "ACCELERATING LONG").sum())
+        accel_short = int((early["acceleration_state"] == "ACCELERATING SHORT").sum())
+        current_spurts = int((pd.to_numeric(early.get("current_spurt_pct"), errors="coerce") >= OI_SPURT_PCT).sum())
+        strong_current_spurts = int((pd.to_numeric(early.get("current_spurt_pct"), errors="coerce") >= OI_STRONG_SPURT_PCT).sum())
         m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Accelerating Long", accel_long)
-        m2.metric("Accelerating Short", accel_short)
-        m3.metric("OI >=2%", active_2)
-        m4.metric("OI >=8%", active_8)
+        m1.metric("Current OI Spurts", current_spurts)
+        m2.metric("Strong Spurts", strong_current_spurts)
+        m3.metric("Accelerating Long", accel_long)
+        m4.metric("Accelerating Short", accel_short)
 
-        active_accel = early[early["build_state"].isin(["🟢 ACCELERATING LONG", "🔴 ACCELERATING SHORT"])]
+        active_spurts = early[pd.to_numeric(early.get("current_spurt_pct"), errors="coerce") >= OI_SPURT_PCT].copy()
+        if not active_spurts.empty:
+            st.markdown("### ⚡ Live OI Spurt highlights")
+            active_spurts = active_spurts.sort_values("current_spurt_pct", ascending=False)
+            for _, r in active_spurts.head(8).iterrows():
+                st.markdown(
+                    f"**#{r.get('money_flow_rank','-')} {r.get('symbol','-')} — {r.get('current_spurt_state','-')}**  "
+                    f"3m OI: **{num(r.get('current_spurt_pct'),3,'%')}** · "
+                    f"Fut vs 09:30: **{num(r.get('spurt_future_vs_930_pct'),2,'%')}** · "
+                    f"Spurts today: **{integer(r.get('spurt_count'))}** · "
+                    f"Max: **{num(r.get('max_spurt_pct'),3,'%')}** · "
+                    f"First: **{time_ist(r.get('first_spurt_time'))}**"
+                )
+
+        active_accel = early[early["acceleration_state"].isin(["ACCELERATING LONG", "ACCELERATING SHORT"])]
         if not active_accel.empty:
             st.markdown("### 🚨 Acceleration highlights")
             for _,r in active_accel.iterrows():
-                border = "#2ea043" if "LONG" in r["build_state"] else "#d1242f"
+                border = "#2ea043" if "LONG" in r["acceleration_state"] else "#d1242f"
                 html = (
                     f'<div style="border:2px solid {border};border-radius:14px;padding:12px 14px;margin:8px 0;">'
                     f'<b>{r.get("build_state","-")} — #{r.get("money_flow_rank","-")} {r.get("symbol","-")}</b><br>'
@@ -643,7 +765,8 @@ with tab2:
         else:
             st.info("No Accelerating Long/Short state has qualified yet on the latest trading day.")
 
-        cols = ["money_flow_rank","symbol","build_state","time_4pct","time_2pct","minutes_2_to_4",
+        cols = ["money_flow_rank","symbol","build_state","current_spurt_state","current_spurt_pct",
+                "spurt_count","max_spurt_pct","first_spurt_time","time_4pct","time_2pct","minutes_2_to_4",
                 "oi_stage","future_oi_change_pct_t0","future_price_change_from_930_pct",
                 "futures_exposure_change_cr","minutes_4_to_8","future_move_at_4pct",
                 "exposure_at_4pct_cr","zone_state","next_zone"]
@@ -652,12 +775,19 @@ with tab2:
             view["time_4pct"] = view["time_4pct"].apply(time_ist)
         if "time_2pct" in view:
             view["time_2pct"] = view["time_2pct"].apply(time_ist)
-        for c in ["future_oi_change_pct_t0","future_price_change_from_930_pct","futures_exposure_change_cr",
+        if "first_spurt_time" in view:
+            view["first_spurt_time"] = view["first_spurt_time"].apply(time_ist)
+        for c in ["current_spurt_pct","max_spurt_pct","future_oi_change_pct_t0","future_price_change_from_930_pct","futures_exposure_change_cr",
                   "minutes_2_to_4","minutes_4_to_8","future_move_at_4pct","exposure_at_4pct_cr"]:
             if c in view: view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
         st.markdown("### All Top-20 stocks")
         st.dataframe(view, use_container_width=True, hide_index=True, column_config={
             "money_flow_rank":"Rank", "symbol":"Symbol", "build_state":"Build State",
+            "current_spurt_state":"Current Spurt",
+            "current_spurt_pct":st.column_config.NumberColumn("3m OI Spurt",format="%.3f%%"),
+            "spurt_count":st.column_config.NumberColumn("Spurt Count",format="%.0f"),
+            "max_spurt_pct":st.column_config.NumberColumn("Max Spurt",format="%.3f%%"),
+            "first_spurt_time":"First Spurt",
             "time_4pct":"Detection Time", "time_2pct":"2% Time", "oi_stage":"OI Stage",
             "future_oi_change_pct_t0":st.column_config.NumberColumn("OI vs 09:30",format="%.2f%%"),
             "future_price_change_from_930_pct":st.column_config.NumberColumn("Fut vs 09:30",format="%.2f%%"),
@@ -668,7 +798,7 @@ with tab2:
             "exposure_at_4pct_cr":st.column_config.NumberColumn("Exposure @4% ₹Cr",format="%.2f"),
             "zone_state":"Zone", "next_zone":"Next Zone"
         })
-        st.markdown('<div class="small-note">v1.0 is frozen for the one-month study. Zone/PCR/IV/options stay as context and do not alter the acceleration label yet.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-note">OI Spurt v1.0 threshold is frozen at 0.50% (strong at 1.00%) for the one-month study. The existing 2→4 acceleration rule is unchanged.</div>', unsafe_allow_html=True)
 
 # ---------------- 30-DAY MONITOR ----------------
 with tab3:
@@ -759,6 +889,12 @@ with tab5:
         y3.metric("Put ΔOI 3m", integer(r.get("put_oi_change_3m")))
         y4.metric("Next zone", str(r.get("next_zone", "-")))
 
+        sp1,sp2,sp3,sp4 = st.columns(4)
+        sp1.metric("3m OI Spurt", num(r.get("current_spurt_pct"),3,"%"))
+        sp2.metric("Spurt State", str(r.get("current_spurt_state","-")))
+        sp3.metric("Spurt Count", integer(r.get("spurt_count")))
+        sp4.metric("First Spurt", time_ist(r.get("first_spurt_time")))
+
         z1, z2, z3, z4 = st.columns(4)
         z1.metric("Call IV", iv_pct(r.get("call_iv")))
         z2.metric("Put IV", iv_pct(r.get("put_iv")))
@@ -781,11 +917,16 @@ with tab5:
                 st.markdown("#### IV — recent 3-minute history")
                 st.line_chart(iv_plot, use_container_width=True)
 
+            if {"future_oi", "future_oi_change_3m"}.issubset(hist.columns):
+                prev_oi = pd.to_numeric(hist["future_oi"], errors="coerce") - pd.to_numeric(hist["future_oi_change_3m"], errors="coerce")
+                hist["oi_spurt_3m_pct"] = (pd.to_numeric(hist["future_oi_change_3m"], errors="coerce") / prev_oi.replace(0, pd.NA)) * 100.0
+
             history_cols = [
                 "ts",
                 "spot",
                 "future_basis",
                 "future_oi_change_3m",
+                "oi_spurt_3m_pct",
                 "call_oi_change_3m",
                 "put_oi_change_3m",
                 "pcr",
